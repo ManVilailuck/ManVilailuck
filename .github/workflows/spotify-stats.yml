@@ -1,10 +1,118 @@
-name: Hello Workflow
+name: Update Spotify sections
+
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */6 * * *'
 
 jobs:
-  test:
+  update:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
     steps:
-      - name: Say hello
-        run: echo "YAML is valid ✅"
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Create generator script
+        run: |
+          mkdir -p scripts
+          cat > scripts/spotify_readme.py << 'PY'
+          import os, re, math, base64, requests
+
+          CID=os.environ["SPOTIFY_CLIENT_ID"]
+          CS=os.environ["SPOTIFY_CLIENT_SECRET"]
+          RT=os.environ["SPOTIFY_REFRESH_TOKEN"]
+
+          def get_token():
+              auth = base64.b64encode(f"{CID}:{CS}".encode()).decode()
+              r = requests.post(
+                  "https://accounts.spotify.com/api/token",
+                  data={"grant_type":"refresh_token","refresh_token":RT},
+                  headers={"Authorization": f"Basic {auth}"},
+                  timeout=30
+              )
+              r.raise_for_status()
+              return r.json()["access_token"]
+
+          def api(url, params=None, token=None):
+              r = requests.get(url, headers={"Authorization": f"Bearer {token}"}, params=params or {}, timeout=30)
+              r.raise_for_status()
+              return r.json()
+
+          def artists_md(items, cols=5):
+              out=[]; i=0; rows=math.ceil(len(items)/cols)
+              for _ in range(rows):
+                  row=[]
+                  for _ in range(cols):
+                      if i>=len(items): break
+                      a=items[i]; imgs=a.get("images",[])
+                      img=(imgs[1]["url"] if len(imgs)>1 else (imgs[0]["url"] if imgs else ""))
+                      row.append(f'<a href="{a["external_urls"]["spotify"]}"><img src="{img}" width="120" alt="{a["name"]}"/></a>')
+                      i+=1
+                  out.append('<p align="left">' + "\n".join(row) + "</p>")
+              return "\n".join(out)
+
+          def albums_md(tracks, top_n=10, cols=5):
+              from collections import defaultdict
+              agg=defaultdict(lambda: {"count":0,"pop":0,"album":None})
+              for t in tracks:
+                  alb=t["album"]; k=alb["id"]
+                  agg[k]["count"]+=1; agg[k]["pop"]+=t.get("popularity",0); agg[k]["album"]=alb
+              ranked=sorted(agg.values(), key=lambda x:(x["count"],x["pop"]), reverse=True)[:top_n]
+              out=[]; i=0; rows=math.ceil(len(ranked)/cols)
+              for _ in range(rows):
+                  row=[]
+                  for _ in range(cols):
+                      if i>=len(ranked): break
+                      alb=ranked[i]["album"]; imgs=alb.get("images",[])
+                      img=(imgs[1]["url"] if len(imgs)>1 else (imgs[0]["url"] if imgs else ""))
+                      row.append(f'<a href="{alb["external_urls"]["spotify"]}"><img src="{img}" width="120" alt="{alb["name"]}"/></a>')
+                      i+=1
+                  out.append('<p align="left">' + "\n".join(row) + "</p>")
+              return "\n".join(out)
+
+          with open("README.md","r",encoding="utf-8") as f:
+              readme=f.read()
+
+          tok=get_token()
+
+          artists=api("https://api.spotify.com/v1/me/top/artists",
+                      {"time_range":"medium_term","limit":10}, tok)["items"]
+          readme=re.sub(r"<!-- TOP_ARTISTS_START -->.*?<!-- TOP_ARTISTS_END -->",
+                        f"<!-- TOP_ARTISTS_START -->\n{artists_md(artists)}\n<!-- TOP_ARTISTS_END -->",
+                        readme, flags=re.S)
+
+          tracks=api("https://api.spotify.com/v1/me/top/tracks",
+                     {"time_range":"medium_term","limit":50}, tok)["items"]
+          readme=re.sub(r"<!-- TOP_ALBUMS_START -->.*?<!-- TOP_ALBUMS_END -->",
+                        f"<!-- TOP_ALBUMS_START -->\n{albums_md(tracks, top_n=10)}\n<!-- TOP_ALBUMS_END -->",
+                        readme, flags=re.S)
+
+          with open("README.md","w",encoding="utf-8") as f:
+              f.write(readme)
+          PY
+
+      - name: Run generator
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
+        run: python scripts/spotify_readme.py
+
+      - name: Commit README updates
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "chore: update Spotify sections" || echo "No changes"
+          git push
